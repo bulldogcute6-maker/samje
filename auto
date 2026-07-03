@@ -1,0 +1,218 @@
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
+
+local ShopPurchase = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Scripts"):WaitForChild("Packages"):WaitForChild("Net"):WaitForChild("RE/ShopPurchase")
+
+local shopConfigPath = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Scripts"):WaitForChild("SHOP_CONFIG")
+local function getConfig()
+    local cfg = nil
+    pcall(function()
+        if shopConfigPath:IsA("ModuleScript") then
+            cfg = require(shopConfigPath)
+        else
+            cfg = shopConfigPath
+        end
+    end)
+    return cfg
+end
+
+local config = getConfig()
+if type(config) ~= "table" then
+    error("SHOP_CONFIG is not a table")
+end
+
+local categories = {"chair", "desktop", "keyboard", "monitor", "table"}
+
+local function matchesWord(str, word)
+    if type(str) ~= "string" then return false end
+    local pattern = "%f[%a]" .. word .. "%f[%A]"
+    return str:lower():find(pattern) ~= nil
+end
+
+local function getPrice(item)
+    if not item then return nil end
+    local price = item.Price or item.Cost or item.BuyPrice or item.SellPrice or item.Value
+    if type(price) == "number" then return price
+    elseif type(price) == "string" then return tonumber(price)
+    else return nil end
+end
+
+local function scanCategory(category, cfg)
+    local itemsMap = {}
+    local function scan(tbl, path)
+        for k, v in pairs(tbl) do
+            if type(v) == "table" then
+                local name = v.Name or v.DisplayName or v.ItemName or k
+                local itemType = v.Type or v.Category or v.ItemType
+                local matched = false
+                if name and matchesWord(tostring(name), category) then matched = true
+                elseif itemType and matchesWord(tostring(itemType), category) then matched = true
+                end
+                if matched then
+                    local price = getPrice(v)
+                    if price and price > 0 then
+                        local existing = itemsMap[name]
+                        if not existing or price < existing.price then
+                            itemsMap[name] = { name = name, price = price }
+                        end
+                    end
+                else
+                    scan(v, path .. " > " .. tostring(k))
+                end
+            end
+        end
+    end
+    scan(cfg, "SHOP_CONFIG")
+    local list = {}
+    for _, item in pairs(itemsMap) do
+        table.insert(list, item)
+    end
+    table.sort(list, function(a,b) return a.price < b.price end)
+    return list
+end
+
+local categoryItems = {}
+for _, cat in ipairs(categories) do
+    categoryItems[cat] = scanCategory(cat, config)
+end
+
+local selectedItems = {}   -- [category] = { [itemName] = true } for fast lookup
+local autoBuyEnabled = false
+local autoBuyLoop = nil
+local dropdownRefs = {}
+local configFileName = "PC_Shop_AutoBuy.json"
+
+local function saveConfig()
+    local data = { selectedItems = selectedItems, autoBuyEnabled = autoBuyEnabled }
+    pcall(function() writefile(configFileName, HttpService:JSONEncode(data)) end)
+end
+
+local function loadConfig()
+    local ok, content = pcall(function() return readfile(configFileName) end)
+    if ok and content then
+        local data = HttpService:JSONDecode(content)
+        if data then
+            selectedItems = data.selectedItems or {}
+            autoBuyEnabled = data.autoBuyEnabled or false
+        end
+    end
+end
+loadConfig()
+
+local function refreshAll()
+    local fresh = getConfig()
+    if not fresh then
+        WindUI:Notify({ Title = "Error", Content = "Cannot reload config", Duration = 3 })
+        return
+    end
+    config = fresh
+    for _, cat in ipairs(categories) do
+        categoryItems[cat] = scanCategory(cat, config)
+    end
+    for _, cat in ipairs(categories) do
+        local items = categoryItems[cat] or {}
+        local opts = {}
+        for _, item in ipairs(items) do
+            table.insert(opts, string.format("%s ($%.2f)", item.name, item.price))
+        end
+        if #opts == 0 then table.insert(opts, "No items found") end
+        local dd = dropdownRefs[cat]
+        if dd then
+            dd:Refresh(opts)
+            local saved = selectedItems[cat] or {}
+            local selectedValues = {}
+            for _, item in ipairs(items) do
+                if saved[item.name] then
+                    table.insert(selectedValues, string.format("%s ($%.2f)", item.name, item.price))
+                end
+            end
+            dd:SetValue(selectedValues)
+        end
+    end
+    WindUI:Notify({ Title = "Refreshed", Content = "Lists updated", Duration = 2 })
+end
+
+local function buyItem(itemName)
+    if not itemName or itemName == "" then return end
+    pcall(function() ShopPurchase:FireServer("PcParts", itemName, 1) end)
+end
+
+local function startAutoBuy()
+    if autoBuyLoop then task.cancel(autoBuyLoop) end
+    autoBuyLoop = task.spawn(function()
+        while autoBuyEnabled do
+            for cat, items in pairs(selectedItems) do
+                for itemName in pairs(items) do
+                    buyItem(itemName)
+                    task.wait(0.5)
+                end
+            end
+            task.wait(2)
+        end
+    end)
+end
+
+local function stopAutoBuy()
+    if autoBuyLoop then task.cancel(autoBuyLoop); autoBuyLoop = nil end
+end
+
+local win = WindUI:CreateWindow({ Title = "da shop", Size = UDim2.fromOffset(450, 620), Resizable = true })
+local tab = win:Tab({ Title = "Shop", Icon = "shopping-cart" })
+local section = tab:Section({ Title = "jerome customize this if u want", Opened = true })
+
+for _, cat in ipairs(categories) do
+    local items = categoryItems[cat] or {}
+    local opts = {}
+    for _, item in ipairs(items) do
+        table.insert(opts, string.format("%s ($%.2f)", item.name, item.price))
+    end
+    if #opts == 0 then table.insert(opts, "No items found") end
+    local saved = selectedItems[cat] or {}
+    local selectedValues = {}
+    for _, item in ipairs(items) do
+        if saved[item.name] then
+            table.insert(selectedValues, string.format("%s ($%.2f)", item.name, item.price))
+        end
+    end
+    local dd = section:Dropdown({
+        Title = string.upper(cat) .. string.format(" (%d items)", #items),
+        Values = opts,
+        Value = selectedValues,
+        Multi = true,
+        AllowNone = true,
+        Callback = function(selectedList)
+            -- selectedList is a list of selected display strings
+            local newSelected = {}
+            for _, display in ipairs(selectedList) do
+                local name = display:match("^(.-) %(")
+                if name then newSelected[name] = true end
+            end
+            selectedItems[cat] = newSelected
+            saveConfig()
+        end,
+    })
+    dropdownRefs[cat] = dd
+end
+
+section:Button({ Title = "Refresh Lists", Icon = "refresh-ccw", Callback = refreshAll })
+section:Toggle({ Title = "Auto‑Buy Selected Items", Value = autoBuyEnabled, Callback = function(v)
+    autoBuyEnabled = v
+    saveConfig()
+    if autoBuyEnabled then startAutoBuy() else stopAutoBuy() end
+end })
+section:Button({ Title = "Buy Selected Now (once)", Icon = "shopping-cart", Callback = function()
+    for cat, items in pairs(selectedItems) do
+        for itemName in pairs(items) do
+            buyItem(itemName)
+            task.wait(0.3)
+        end
+    end
+    WindUI:Notify({ Title = "Purchase", Content = "Buy sent", Duration = 2 })
+end })
+
+win:Open()
+WindUI:Notify({ Title = "Ready", Content = "W Jerome", Duration = 5 })
