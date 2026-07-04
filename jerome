@@ -1,0 +1,896 @@
+local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
+if not Library then error("Failed to load Obsidian UI") end
+
+local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+ThemeManager:SetFolder("CompShopUltimate")
+SaveManager:SetFolder("CompShopUltimate")
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local LP = Players.LocalPlayer
+
+local Net = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Scripts"):WaitForChild("Packages"):WaitForChild("Net"))
+local selectPCRemote = Net:RemoteEvent("selectPC")
+local appointNPCRemote = Net:RemoteEvent("AppointNPC")
+local rejectNPCRemote = Net:RemoteEvent("RejectNPC")
+
+local MerchantOpen = Net:RemoteEvent("MerchantOpen")
+local MerchantRequest = Net:RemoteEvent("MerchantRequest")
+local MerchantUpdate = Net:RemoteEvent("MerchantUpdate")
+local MerchantNotice = Net:RemoteEvent("MerchantNotice")
+
+local autoCleanEnabled = false
+local autoCleanLoop = nil
+local autoFireExtinguishEnabled = false
+local autoFireExtinguishLoop = nil
+local antiAfkEnabled = false
+local antiAfkLoop = nil
+local autoAppointEnabled = false
+local autoAppointConnections = {}
+
+local merchantState = {
+    Visible = false,
+    Token = nil,
+    Revision = 0,
+    CycleId = 0,
+    ActiveEndsAt = 0,
+    NextArrivalAt = 0,
+    Offers = {},
+    AutoBuyItems = {},
+    AutoBuyEnabled = false,
+    AutoBuyLoop = nil,
+    BuyLock = false,
+}
+
+local configFileName = "CompShopUltimate_Config.json"
+
+local function startAntiAfk()
+    if antiAfkLoop then task.cancel(antiAfkLoop) end
+    antiAfkLoop = task.spawn(function()
+        while antiAfkEnabled do
+            pcall(function()
+                local x = math.random(-1, 1)
+                local y = math.random(-1, 1)
+                if x == 0 and y == 0 then x = 1 end
+                UserInputService:SetMouseDelta(Vector2.new(x, y))
+            end)
+            task.wait(60)
+        end
+    end)
+end
+
+local function stopAntiAfk()
+    if antiAfkLoop then task.cancel(antiAfkLoop); antiAfkLoop = nil end
+end
+
+local function isPlayerInShop(shop)
+    local char = LP.Character
+    if not char then return false end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    if root:IsDescendantOf(shop) then return true end
+    local ok, cf, size = pcall(function() return shop:GetBoundingBox() end)
+    if ok and cf and size then
+        local localPos = cf:PointToObjectSpace(root.Position)
+        local half = size/2
+        if math.abs(localPos.X) <= half.X and math.abs(localPos.Y) <= half.Y and math.abs(localPos.Z) <= half.Z then
+            return true
+        end
+    end
+    return false
+end
+
+local function getPlayerShop()
+    local bases = Workspace:FindFirstChild("Bases")
+    if not bases then return nil end
+    for _, shop in ipairs(bases:GetChildren()) do
+        if shop:IsA("Model") and shop.Name == "Shop" then
+            local occupied = shop:GetAttribute("Occupied")
+            if occupied then
+                local owner = shop:GetAttribute("Owner") or shop:GetAttribute("OwnerUserId")
+                if owner and (owner == LP.Name or tostring(owner) == tostring(LP.UserId)) then
+                    if isPlayerInShop(shop) then
+                        return shop
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function equipWalis()
+    local char = LP.Character
+    if not char then return false end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return false end
+    for _, tool in ipairs(char:GetChildren()) do
+        if tool:IsA("Tool") and tool.Name == "Walis" then
+            return true
+        end
+    end
+    local backpack = LP:FindFirstChildOfClass("Backpack")
+    if backpack then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") and tool.Name == "Walis" then
+                humanoid:EquipTool(tool)
+                task.wait(0.2)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function cleanMesses(shop)
+    local cleaningSystem = shop:FindFirstChild("CleaningSystem")
+    if not cleaningSystem then return end
+    local activeMesses = cleaningSystem:FindFirstChild("ActiveMesses")
+    if not activeMesses then return end
+    for _, mess in ipairs(activeMesses:GetChildren()) do
+        if mess:IsA("Model") and mess.Name:match("Mess") then
+            local prompt = mess:FindFirstChild("CleanPrompt")
+            if prompt and prompt:IsA("ProximityPrompt") then
+                local oldHold = prompt.HoldDuration
+                prompt.HoldDuration = 0
+                pcall(function()
+                    fireproximityprompt(prompt, 0)
+                end)
+                prompt.HoldDuration = oldHold
+                task.wait(0.1)
+            end
+        end
+    end
+end
+
+local function startAutoClean()
+    if autoCleanLoop then task.cancel(autoCleanLoop) end
+    autoCleanLoop = task.spawn(function()
+        while autoCleanEnabled do
+            local shop = getPlayerShop()
+            if shop then
+                if equipWalis() then
+                    cleanMesses(shop)
+                end
+            end
+            task.wait(0.5)
+        end
+    end)
+end
+
+local function stopAutoClean()
+    if autoCleanLoop then task.cancel(autoCleanLoop); autoCleanLoop = nil end
+end
+
+local function equipFireExtinguisher()
+    local char = LP.Character
+    if not char then return false end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return false end
+    for _, tool in ipairs(char:GetChildren()) do
+        if tool:IsA("Tool") and tool.Name == "Fire Extinguisher" then
+            return true
+        end
+    end
+    local backpack = LP:FindFirstChildOfClass("Backpack")
+    if backpack then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") and tool.Name == "Fire Extinguisher" then
+                humanoid:EquipTool(tool)
+                task.wait(0.2)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function findFirePromptsInShop(shop)
+    local prompts = {}
+    local pcs = shop:FindFirstChild("PCS")
+    if not pcs then return prompts end
+    for _, pcModel in ipairs(pcs:GetChildren()) do
+        if not pcModel:IsA("Model") then continue end
+        if not tonumber(pcModel.Name) then continue end
+        local desktop = pcModel:FindFirstChild("Desktop")
+        if not desktop then continue end
+        for _, desc in ipairs(desktop:GetDescendants()) do
+            if desc:IsA("ProximityPrompt") and desc.Enabled then
+                local isFirePrompt = false
+                if desc.Name == "ExtinguishPrompt" then
+                    isFirePrompt = true
+                elseif desc.Parent and desc.Parent.Name == "FireEffects" then
+                    isFirePrompt = true
+                end
+                if isFirePrompt then
+                    table.insert(prompts, desc)
+                end
+            end
+        end
+    end
+    return prompts
+end
+
+local function extinguishFires(shop)
+    if not shop then return 0 end
+    local prompts = findFirePromptsInShop(shop)
+    if #prompts == 0 then return 0 end
+    if not equipFireExtinguisher() then
+        Library:Notify({ Title = "Fire Extinguish", Description = "Fire Extinguisher not found.", Duration = 2 })
+        return 0
+    end
+    local extinguished = 0
+    for _, prompt in ipairs(prompts) do
+        if prompt.Enabled then
+            local holdDur = prompt.HoldDuration or 2
+            local ok = pcall(function()
+                fireproximityprompt(prompt, holdDur)
+            end)
+            if ok then
+                extinguished = extinguished + 1
+                task.wait(0.1)
+            end
+        end
+    end
+    return extinguished
+end
+
+local function doFireExtinguish()
+    local shop = getPlayerShop()
+    if not shop then
+        Library:Notify({ Title = "Fire Extinguish", Description = "Not in your Shop.", Duration = 2 })
+        return
+    end
+    local count = extinguishFires(shop)
+    if count > 0 then
+        Library:Notify({ Title = "Fire Extinguish", Description = "Extinguished " .. count .. " fire(s).", Duration = 3 })
+    else
+        Library:Notify({ Title = "Fire Extinguish", Description = "No fires found.", Duration = 2 })
+    end
+end
+
+local function startAutoFireExtinguish()
+    if autoFireExtinguishLoop then task.cancel(autoFireExtinguishLoop) end
+    autoFireExtinguishLoop = task.spawn(function()
+        while autoFireExtinguishEnabled do
+            local shop = getPlayerShop()
+            if shop then
+                local count = extinguishFires(shop)
+                if count > 0 then
+                    Library:Notify({ Title = "Auto Fire Extinguish", Description = "Extinguished " .. count .. " fire(s).", Duration = 3 })
+                end
+            end
+            task.wait(1)
+        end
+    end)
+end
+
+local function stopAutoFireExtinguish()
+    if autoFireExtinguishLoop then task.cancel(autoFireExtinguishLoop); autoFireExtinguishLoop = nil end
+end
+
+local function getPcList()
+    local mainUi = LP.PlayerGui:FindFirstChild("MainUi")
+    if not mainUi then return nil end
+    local serverFrame = mainUi:FindFirstChild("ServerFrame")
+    if not serverFrame then return nil end
+    return serverFrame:FindFirstChild("PcList")
+end
+
+local function getAvailablePCSlots()
+    local slots = {}
+    local pcList = getPcList()
+    if not pcList then return slots end
+    for _, child in ipairs(pcList:GetChildren()) do
+        if child:IsA("Frame") and child.Name:match("^Pc%d+$") then
+            local appointFrame = child:FindFirstChild("AppointFrame")
+            if appointFrame then
+                local buttonFrame = appointFrame:FindFirstChild("ButtonFrame")
+                if buttonFrame then
+                    local button = buttonFrame:FindFirstChild("Button")
+                    if button and button:IsA("TextButton") and button.Visible then
+                        local rejectFrame = child:FindFirstChild("RejectFrame")
+                        if not rejectFrame or not rejectFrame.Visible then
+                            table.insert(slots, child.Name)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(slots, function(a,b)
+        local numA = tonumber(a:match("%d+")) or 0
+        local numB = tonumber(b:match("%d+")) or 0
+        return numA < numB
+    end)
+    return slots
+end
+
+local function doAppoint()
+    if not selectPCRemote or not appointNPCRemote then
+        Library:Notify({ Title = "Appoint Error", Description = "Remotes missing.", Duration = 3 })
+        return false
+    end
+    local slots = getAvailablePCSlots()
+    if #slots == 0 then
+        Library:Notify({ Title = "Appoint Error", Description = "No available PC slots found", Duration = 3 })
+        return false
+    end
+    local slot = slots[1]
+    pcall(function() selectPCRemote:FireServer(slot) end)
+    task.wait(0.2)
+    pcall(function() appointNPCRemote:FireServer() end)
+    Library:Notify({ Title = "Appoint", Description = string.format("Appointed to %s", slot), Duration = 2 })
+    return true
+end
+
+local function rejectCurrentNPC()
+    if rejectNPCRemote then
+        pcall(function() rejectNPCRemote:FireServer() end)
+        Library:Notify({ Title = "Reject", Description = "Rejected current NPC", Duration = 2 })
+    end
+end
+
+local function getCurrentNPCFromUI()
+    local mainUi = LP.PlayerGui:FindFirstChild("MainUi")
+    if not mainUi then return nil end
+    local serverFrame = mainUi:FindFirstChild("ServerFrame")
+    if not serverFrame then return nil end
+    local npcInfo = serverFrame:FindFirstChild("NpcInfo")
+    if not npcInfo then return nil end
+    local function findNPCName(parent)
+        for _, child in ipairs(parent:GetChildren()) do
+            if child:IsA("TextLabel") or child:IsA("TextButton") then
+                local text = child.Text
+                if text and #text > 0 and text ~= "Appoint Here" and text ~= "Reject" and text ~= "X" and text ~= "Close" then
+                    return text
+                end
+            elseif child:IsA("Frame") or child:IsA("ScrollingFrame") then
+                local found = findNPCName(child)
+                if found then return found end
+            end
+        end
+        return nil
+    end
+    return findNPCName(npcInfo)
+end
+
+local function processNPC(frame)
+    if not frame or not frame:IsA("Frame") then return end
+    if not autoAppointEnabled then return end
+    local appointFrame = frame:FindFirstChild("AppointFrame")
+    if not appointFrame or not appointFrame.Visible then return end
+    local name = frame.Name
+    pcall(function()
+        selectPCRemote:FireServer(name)
+        task.wait(0.1)
+        appointNPCRemote:FireServer()
+    end)
+end
+
+local function startAutoAppoint()
+    if autoAppointEnabled then return end
+    autoAppointEnabled = true
+    local pcList = getPcList()
+    if not pcList then
+        Library:Notify({ Title = "Auto-Appoint", Description = "PcList not found.", Duration = 3 })
+        return
+    end
+    for _, child in ipairs(pcList:GetChildren()) do
+        processNPC(child)
+    end
+    table.insert(autoAppointConnections, pcList.ChildAdded:Connect(function(child)
+        processNPC(child)
+    end))
+    Library:Notify({ Title = "Auto-Appoint", Description = "Active. Waiting for NPCs...", Duration = 2 })
+end
+
+local function stopAutoAppoint()
+    autoAppointEnabled = false
+    for _, conn in ipairs(autoAppointConnections) do
+        pcall(conn.Disconnect, conn)
+    end
+    autoAppointConnections = {}
+    Library:Notify({ Title = "Auto-Appoint", Description = "Stopped.", Duration = 2 })
+end
+
+local function formatMerchantTime(seconds)
+    seconds = math.max(0, math.floor(seconds))
+    return string.format("%d:%02d", math.floor(seconds / 60), seconds % 60)
+end
+
+local function openMerchant()
+    if MerchantOpen then pcall(function() MerchantOpen:FireServer() end) end
+end
+
+local function refreshMerchant()
+    if MerchantRequest and merchantState.Token then
+        pcall(function()
+            MerchantRequest:FireServer("Refresh", merchantState.Token, merchantState.Revision, merchantState.CycleId)
+        end)
+    elseif MerchantRequest then
+        pcall(function() MerchantRequest:FireServer() end)
+    end
+end
+
+local function buyMerchantItem(itemId)
+    if merchantState.Token and not merchantState.BuyLock then
+        merchantState.BuyLock = true
+        pcall(function()
+            MerchantRequest:FireServer("Purchase", merchantState.Token, merchantState.Revision, merchantState.CycleId, itemId)
+        end)
+        task.wait(0.5)
+        merchantState.BuyLock = false
+    end
+end
+
+local function toggleMerchantAutoBuy(itemId)
+    if merchantState.AutoBuyItems[itemId] then
+        merchantState.AutoBuyItems[itemId] = nil
+    else
+        merchantState.AutoBuyItems[itemId] = true
+    end
+    saveConfig()
+    return merchantState.AutoBuyItems[itemId] == true
+end
+
+local function isMerchantAutoBuy(itemId)
+    return merchantState.AutoBuyItems[itemId] == true
+end
+
+local function startMerchantAutoBuy()
+    if merchantState.AutoBuyLoop then task.cancel(merchantState.AutoBuyLoop) end
+    merchantState.AutoBuyLoop = task.spawn(function()
+        while merchantState.AutoBuyEnabled do
+            if merchantState.Visible and #merchantState.Offers > 0 then
+                for _, offer in ipairs(merchantState.Offers) do
+                    if merchantState.AutoBuyItems[offer.Id] and offer.Stock and offer.Stock > 0 then
+                        buyMerchantItem(offer.Id)
+                        task.wait(0.3)
+                    end
+                end
+            end
+            task.wait(2)
+        end
+    end)
+end
+
+local function stopMerchantAutoBuy()
+    if merchantState.AutoBuyLoop then task.cancel(merchantState.AutoBuyLoop); merchantState.AutoBuyLoop = nil end
+end
+
+local function applyMerchantData(data, isInitial)
+    if type(data) ~= "table" then return end
+    if data.Close == true then
+        merchantState.Visible = false
+        merchantState.Token = nil
+        if merchantState.AutoBuyEnabled then
+            Library:Notify({ Title = "Merchant", Description = "Merchant closed", Duration = 2 })
+        end
+        return
+    end
+    if type(data.Token) == "string" and type(data.Revision) == "number" and type(data.CycleId) == "number" and type(data.Offers) == "table" then
+        if not isInitial and merchantState.Token and data.Token ~= merchantState.Token then
+            return
+        end
+        merchantState.Token = data.Token
+        merchantState.Revision = data.Revision
+        merchantState.CycleId = data.CycleId
+        merchantState.ActiveEndsAt = type(data.ActiveEndsAt) == "number" and data.ActiveEndsAt or 0
+        merchantState.NextArrivalAt = type(data.NextArrivalAt) == "number" and data.NextArrivalAt or 0
+        merchantState.Visible = true
+        merchantState.Offers = data.Offers
+        if data.Message and data.Message ~= "" then
+            Library:Notify({ Title = "Merchant", Description = data.Message, Duration = 3 })
+        end
+    end
+end
+
+MerchantOpen.OnClientEvent:Connect(function(data)
+    applyMerchantData(data, true)
+end)
+
+MerchantUpdate.OnClientEvent:Connect(function(data)
+    applyMerchantData(data, false)
+end)
+
+MerchantNotice.OnClientEvent:Connect(function(message)
+    if message and message ~= "" then
+        Library:Notify({ Title = "Merchant", Description = message, Duration = 3 })
+    end
+end)
+
+local function saveConfig()
+    local data = {
+        autoCleanEnabled = autoCleanEnabled,
+        autoFireExtinguishEnabled = autoFireExtinguishEnabled,
+        antiAfkEnabled = antiAfkEnabled,
+        merchantAutoBuyItems = merchantState.AutoBuyItems,
+        merchantAutoBuyEnabled = merchantState.AutoBuyEnabled,
+    }
+    pcall(function() writefile(configFileName, HttpService:JSONEncode(data)) end)
+end
+
+local function loadConfig()
+    local ok, content = pcall(function() return readfile(configFileName) end)
+    if ok and content then
+        local data = HttpService:JSONDecode(content)
+        if data then
+            autoCleanEnabled = data.autoCleanEnabled or false
+            autoFireExtinguishEnabled = data.autoFireExtinguishEnabled or false
+            antiAfkEnabled = data.antiAfkEnabled or false
+            merchantState.AutoBuyItems = data.merchantAutoBuyItems or {}
+            merchantState.AutoBuyEnabled = data.merchantAutoBuyEnabled or false
+        end
+    end
+end
+loadConfig()
+
+local Window = Library:CreateWindow({
+    Title = "",
+    Size = UDim2.fromOffset(720, 680),
+    Center = true,
+    ToggleKeybind = Enum.KeyCode.LeftAlt,
+    AutoShow = true,
+})
+
+local MainTab = Window:AddTab({ Name = "Main", Icon = "home" })
+
+local ShopLauncher = MainTab:AddLeftGroupbox("Shop Launcher", "shopping-cart")
+ShopLauncher:AddButton({
+    Text = "Open Shop Script",
+    Func = function()
+        local success, err = pcall(function()
+            loadstring(game:HttpGet("https://raw.githubusercontent.com/IsnowDev7/IsnowDev/refs/heads/main/obfuscated_script-1783141858907.lua.txt"))()
+        end)
+        if not success then
+            Library:Notify({
+                Title = "Shop Error",
+                Description = "Failed to load shop: " .. tostring(err),
+                Duration = 4
+            })
+        else
+            Library:Notify({
+                Title = "Shop Loaded",
+                Description = "Shop script executed successfully.",
+                Duration = 2
+            })
+        end
+    end
+})
+
+local NPCBox = MainTab:AddRightGroupbox("Auto-Appoint NPC", "user")
+NPCBox:AddLabel({ Text = "Automatically appoints NPCs when they appear.", DoesWrap = true, Size = 11 })
+NPCBox:AddButton({ Text = "Appoint Now", Func = doAppoint })
+NPCBox:AddButton({ Text = "Reject Current NPC", Func = rejectCurrentNPC })
+NPCBox:AddToggle("AutoAppointToggle", {
+    Text = "Auto Appoint (event-driven)",
+    Default = false,
+    Callback = function(v)
+        if v then startAutoAppoint() else stopAutoAppoint() end
+    end,
+})
+local currentNPCLabel = NPCBox:AddLabel("CurrentNPC", { Text = "Current NPC: Scanning...", DoesWrap = true })
+task.spawn(function()
+    while true do
+        local current = getCurrentNPCFromUI()
+        currentNPCLabel:SetText(current and ("Current NPC: " .. current) or "Current NPC: None")
+        task.wait(1)
+    end
+end)
+
+local CleanBox = MainTab:AddRightGroupbox("Auto Clean", "broom")
+CleanBox:AddLabel({ Text = "Scans your Shop for messes, equips Walis, cleans.", DoesWrap = true, Size = 11 })
+CleanBox:AddToggle("AutoCleanToggle", {
+    Text = "Auto Clean",
+    Default = autoCleanEnabled,
+    Callback = function(v)
+        autoCleanEnabled = v
+        saveConfig()
+        if autoCleanEnabled then startAutoClean() else stopAutoClean() end
+    end,
+})
+CleanBox:AddButton({
+    Text = "Clean Once",
+    Func = function()
+        local shop = getPlayerShop()
+        if shop then
+            if equipWalis() then
+                cleanMesses(shop)
+                Library:Notify({ Title = "Clean", Description = "Cleaned messes.", Duration = 2 })
+            else
+                Library:Notify({ Title = "Clean", Description = "Walis not found.", Duration = 2 })
+            end
+        else
+            Library:Notify({ Title = "Clean", Description = "Not in your Shop.", Duration = 2 })
+        end
+    end,
+})
+
+local FireBox = MainTab:AddRightGroupbox("Auto Fire Extinguish", "fire")
+FireBox:AddLabel({ Text = "Extinguish fires in your Shop.", DoesWrap = true, Size = 11 })
+FireBox:AddToggle("AutoFireExtinguishToggle", {
+    Text = "Auto Fire Extinguish",
+    Default = autoFireExtinguishEnabled,
+    Callback = function(v)
+        autoFireExtinguishEnabled = v
+        saveConfig()
+        if autoFireExtinguishEnabled then startAutoFireExtinguish() else stopAutoFireExtinguish() end
+    end,
+})
+FireBox:AddButton({ Text = "Extinguish Once", Func = doFireExtinguish })
+
+local AntiAfkBox = MainTab:AddRightGroupbox("Anti-AFK", "clock")
+AntiAfkBox:AddLabel({ Text = "Prevents AFK kick via small mouse movements.", DoesWrap = true, Size = 11 })
+AntiAfkBox:AddToggle("AntiAfkToggle", {
+    Text = "Enable Anti-AFK",
+    Default = antiAfkEnabled,
+    Callback = function(v)
+        antiAfkEnabled = v
+        saveConfig()
+        if antiAfkEnabled then startAntiAfk() else stopAntiAfk() end
+    end,
+})
+
+local MerchantTab = Window:AddTab({ Name = "Merchant", Icon = "store", Description = "Merchant stock & auto-buy" })
+local MerchantBox = MerchantTab:AddLeftGroupbox("Merchant Displays", "list")
+
+local merchantStatusLabel = MerchantBox:AddLabel("MerchantStatus", {
+    Text = "Merchant: Closed",
+    DoesWrap = true,
+})
+local merchantTimerLabel = MerchantBox:AddLabel("MerchantTimer", {
+    Text = "Next arrival: --:--",
+    DoesWrap = true,
+})
+
+MerchantBox:AddButton({ Text = "Open Merchant", Func = openMerchant })
+MerchantBox:AddButton({ Text = "Refresh Merchant", Func = refreshMerchant })
+MerchantBox:AddDivider()
+
+MerchantBox:AddToggle("MerchantAutoBuyToggle", {
+    Text = "Auto-Buy Selected Merchant Items",
+    Default = merchantState.AutoBuyEnabled,
+    Callback = function(v)
+        merchantState.AutoBuyEnabled = v
+        saveConfig()
+        if merchantState.AutoBuyEnabled then
+            startMerchantAutoBuy()
+        else
+            stopMerchantAutoBuy()
+        end
+    end,
+})
+
+local merchantContainer = Instance.new("Frame")
+merchantContainer.Size = UDim2.fromScale(1, 1)
+merchantContainer.BackgroundTransparency = 1
+
+local merchantScroll = Instance.new("ScrollingFrame")
+merchantScroll.Size = UDim2.fromScale(1, 1)
+merchantScroll.BackgroundTransparency = 1
+merchantScroll.BorderSizePixel = 0
+merchantScroll.ScrollBarThickness = 4
+merchantScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+merchantScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+merchantScroll.Parent = merchantContainer
+
+local merchantLayout = Instance.new("UIListLayout")
+merchantLayout.SortOrder = Enum.SortOrder.LayoutOrder
+merchantLayout.Padding = UDim.new(0, 4)
+merchantLayout.Parent = merchantScroll
+
+local merchantPadding = Instance.new("UIPadding")
+merchantPadding.PaddingTop = UDim.new(0, 4)
+merchantPadding.PaddingBottom = UDim.new(0, 4)
+merchantPadding.PaddingLeft = UDim.new(0, 4)
+merchantPadding.PaddingRight = UDim.new(0, 4)
+merchantPadding.Parent = merchantScroll
+
+MerchantBox:AddUIPassthrough("MerchantItemList", {
+    Instance = merchantContainer,
+    Height = 400,
+})
+
+local function renderMerchantItems()
+    for _, child in ipairs(merchantScroll:GetChildren()) do
+        if child:IsA("Frame") and child.Name:match("MerchantItem_") then
+            child:Destroy()
+        end
+    end
+    if not merchantState.Visible or #merchantState.Offers == 0 then
+        local emptyLabel = Instance.new("TextLabel")
+        emptyLabel.Size = UDim2.fromScale(1, 1)
+        emptyLabel.BackgroundTransparency = 1
+        emptyLabel.Font = Enum.Font.Code
+        emptyLabel.Text = "No merchant items.\nClick 'Open Merchant' to load."
+        emptyLabel.TextColor3 = Color3.fromRGB(148, 163, 184)
+        emptyLabel.Parent = merchantScroll
+        return
+    end
+    for _, offer in ipairs(merchantState.Offers) do
+        if type(offer) == "table" and type(offer.Id) == "string" then
+            local row = Instance.new("Frame")
+            row.Name = "MerchantItem_" .. offer.Id
+            row.Size = UDim2.new(1, -8, 0, 60)
+            row.BackgroundColor3 = Color3.fromRGB(20, 25, 40)
+            row.BackgroundTransparency = 0.2
+            row.BorderSizePixel = 0
+            row.Parent = merchantScroll
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 6)
+            corner.Parent = row
+            local nameLabel = Instance.new("TextLabel")
+            nameLabel.Size = UDim2.new(0.4, -10, 0, 22)
+            nameLabel.Position = UDim2.fromOffset(8, 4)
+            nameLabel.BackgroundTransparency = 1
+            nameLabel.Font = Enum.Font.GothamBold
+            nameLabel.Text = tostring(offer.Name or "Unknown")
+            nameLabel.TextSize = 14
+            nameLabel.TextColor3 = Color3.fromRGB(232, 240, 255)
+            nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+            nameLabel.Parent = row
+            local priceLabel = Instance.new("TextLabel")
+            priceLabel.Size = UDim2.new(0, 100, 0, 20)
+            priceLabel.Position = UDim2.fromOffset(8, 30)
+            priceLabel.BackgroundTransparency = 1
+            priceLabel.Font = Enum.Font.Code
+            priceLabel.Text = "$" .. tostring(offer.Price or 1)
+            priceLabel.TextSize = 12
+            priceLabel.TextColor3 = Color3.fromRGB(124, 252, 0)
+            priceLabel.TextXAlignment = Enum.TextXAlignment.Left
+            priceLabel.Parent = row
+            local stock = offer.Stock or 0
+            local stockLabel = Instance.new("TextLabel")
+            stockLabel.Size = UDim2.new(0, 80, 0, 20)
+            stockLabel.Position = UDim2.fromOffset(110, 30)
+            stockLabel.BackgroundTransparency = 1
+            stockLabel.Font = Enum.Font.Code
+            stockLabel.Text = "Stock: " .. tostring(stock)
+            stockLabel.TextSize = 12
+            stockLabel.TextColor3 = stock > 0 and Color3.fromRGB(34, 197, 94) or Color3.fromRGB(239, 68, 68)
+            stockLabel.TextXAlignment = Enum.TextXAlignment.Left
+            stockLabel.Parent = row
+            if offer.Image and offer.Image ~= "" then
+                local imgLabel = Instance.new("ImageLabel")
+                imgLabel.Size = UDim2.fromOffset(36, 36)
+                imgLabel.Position = UDim2.new(1, -46, 0, 12)
+                imgLabel.BackgroundTransparency = 1
+                imgLabel.Image = offer.Image
+                imgLabel.ScaleType = Enum.ScaleType.Fit
+                imgLabel.Parent = row
+                local imgCorner = Instance.new("UICorner")
+                imgCorner.CornerRadius = UDim.new(0, 4)
+                imgCorner.Parent = imgLabel
+            end
+            local buyButton = Instance.new("TextButton")
+            buyButton.Size = UDim2.new(0, 60, 0, 28)
+            buyButton.Position = UDim2.new(1, -110, 0, 16)
+            buyButton.Text = stock > 0 and "Buy" or "Sold"
+            buyButton.TextSize = 12
+            buyButton.Font = Enum.Font.GothamBold
+            buyButton.AutoButtonColor = stock > 0
+            buyButton.BackgroundColor3 = stock > 0 and Color3.fromRGB(59, 130, 246) or Color3.fromRGB(60, 60, 60)
+            buyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+            buyButton.Parent = row
+            local buyCorner = Instance.new("UICorner")
+            buyCorner.CornerRadius = UDim.new(0, 4)
+            buyCorner.Parent = buyButton
+            if stock > 0 then
+                buyButton.MouseButton1Click:Connect(function()
+                    buyMerchantItem(offer.Id)
+                end)
+            end
+            local autoToggle = Instance.new("TextButton")
+            autoToggle.Size = UDim2.new(0, 30, 0, 28)
+            autoToggle.Position = UDim2.new(1, -44, 0, 16)
+            local isAuto = isMerchantAutoBuy(offer.Id)
+            autoToggle.Text = isAuto and "â˜…" or "â˜†"
+            autoToggle.TextSize = 16
+            autoToggle.Font = Enum.Font.GothamBold
+            autoToggle.AutoButtonColor = false
+            autoToggle.BackgroundColor3 = isAuto and Color3.fromRGB(232, 45, 67) or Color3.fromRGB(40, 40, 50)
+            autoToggle.TextColor3 = isAuto and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(148, 163, 184)
+            autoToggle.Parent = row
+            local autoCorner = Instance.new("UICorner")
+            autoCorner.CornerRadius = UDim.new(0, 4)
+            autoCorner.Parent = autoToggle
+            autoToggle.MouseButton1Click:Connect(function()
+                local newState = toggleMerchantAutoBuy(offer.Id)
+                autoToggle.Text = newState and "â˜…" or "â˜†"
+                autoToggle.BackgroundColor3 = newState and Color3.fromRGB(232, 45, 67) or Color3.fromRGB(40, 40, 50)
+                autoToggle.TextColor3 = newState and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(148, 163, 184)
+            end)
+        end
+    end
+end
+
+local function updateMerchantTimer()
+    local now = os.time()
+    local timerText = ""
+    local statusText = ""
+    if merchantState.Visible then
+        statusText = "ðŸŸ¢ Merchant: Open"
+        if merchantState.ActiveEndsAt > 0 and now < merchantState.ActiveEndsAt then
+            local remaining = merchantState.ActiveEndsAt - now
+            timerText = "â³ Leaves in: " .. formatMerchantTime(remaining)
+        elseif merchantState.NextArrivalAt > 0 and now < merchantState.NextArrivalAt then
+            local remaining = merchantState.NextArrivalAt - now
+            timerText = "â³ Next arrival in: " .. formatMerchantTime(remaining)
+        else
+            timerText = "âŒ Merchant unavailable"
+        end
+    else
+        statusText = "ðŸ”´ Merchant: Closed"
+        if merchantState.NextArrivalAt > 0 and now < merchantState.NextArrivalAt then
+            local remaining = merchantState.NextArrivalAt - now
+            timerText = "â³ Arrives in: " .. formatMerchantTime(remaining)
+        else
+            timerText = "â³ No arrival time set"
+        end
+    end
+    merchantStatusLabel:SetText(statusText)
+    merchantTimerLabel:SetText(timerText)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        pcall(function()
+            updateMerchantTimer()
+            if merchantState.Visible then
+                renderMerchantItems()
+            end
+        end)
+    end
+end)
+
+local oldApply = applyMerchantData
+applyMerchantData = function(data, isInitial)
+    oldApply(data, isInitial)
+    if merchantState.Visible then
+        renderMerchantItems()
+        updateMerchantTimer()
+    end
+end
+
+MerchantOpen.OnClientEvent:Connect(function(data)
+    applyMerchantData(data, true)
+end)
+
+MerchantUpdate.OnClientEvent:Connect(function(data)
+    applyMerchantData(data, false)
+end)
+
+if merchantState.AutoBuyEnabled then
+    startMerchantAutoBuy()
+end
+if antiAfkEnabled then startAntiAfk() end
+
+ThemeManager:ApplyToTab(MainTab)
+ThemeManager:ApplyToTab(MerchantTab)
+SaveManager:BuildConfigSection(MainTab)
+SaveManager:BuildConfigSection(MerchantTab)
+pcall(function() ThemeManager:LoadDefault() end)
+pcall(function() SaveManager:LoadAutoloadConfig() end)
+
+Library:OnUnload(function()
+    if merchantState.AutoBuyLoop then task.cancel(merchantState.AutoBuyLoop) end
+    saveConfig()
+end)
+
+Library:Notify({
+    Title = "",
+    Description = "Loaded successfully.",
+    Duration = 2,
+})
