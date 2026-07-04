@@ -1,0 +1,83 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+-- Get the Net module and Remotes exactly like the game does
+local SharedScripts = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Scripts"):WaitForChild("Packages")
+local Net = require(SharedScripts:WaitForChild("Net"))
+
+local AppointNPC = Net:RemoteEvent("AppointNPC")
+local SelectPC = Net:RemoteEvent("selectPC")
+
+-- Locating the game's UI list
+local ServerFrame = LocalPlayer:WaitForChild("PlayerGui"):WaitForChild("MainUi"):WaitForChild("ServerFrame")
+local PcList = ServerFrame:WaitForChild("PcList")
+
+-- UI Library Setup (Rayfield Obsidian/Charcoal Theme)
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+local Window = Rayfield:CreateWindow({
+   Name = "Obsidian UI | Auto-Appoint Fix",
+   LoadingTitle = "Initializing...",
+   LoadingSubtitle = "by Gemini",
+   Theme = "Charcoal",
+   ConfigurationSaving = { Enabled = false },
+   Discord = { Enabled = false },
+   KeySystem = false
+})
+
+local MainTab = Window:CreateTab("Main", nil)
+local AutoActive = false
+
+-- Function to handle the selection and appointment process
+local function processNPC(npcFrame)
+    if npcFrame:IsA("Frame") and AutoActive then
+        pcall(function()
+            -- Step 1: Tell the server we are selecting this NPC
+            SelectPC:FireServer(npcFrame.Name)
+            task.wait(0.1) -- Short delay to let the server process the selection
+            
+            -- Step 2: Fire the appointment remote
+            AppointNPC:FireServer()
+        end)
+    end
+end
+
+-- Loop to clear out any NPCs already sitting in the list
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if AutoActive then
+            for _, child in ipairs(PcList:GetChildren()) do
+                processNPC(child)
+            end
+        end
+    end
+end)
+
+-- Automatically handle new NPCs the exact moment they enter the list
+PcList.ChildAdded:Connect(function(child)
+    if AutoActive then
+        processNPC(child)
+    end
+end)
+
+-- UI Toggle
+MainTab:CreateToggle({
+   Name = "Auto Appoint NPC",
+   CurrentValue = false,
+   Flag = "AutoAppointSystem", 
+   Callback = function(Value)
+      AutoActive = Value
+      Rayfield:Notify({
+         Title = "System Log",
+         Content = Value and "Auto-Appoint is now ACTIVE" or "Auto-Appoint is now INACTIVE",
+         Duration = 2,
+      })
+   end,
+})
+
+Rayfield:Notify({
+   Title = "Loaded",
+   Content = "Ready to auto-appoint!",
+   Duration = 3,
+})
